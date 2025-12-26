@@ -2,6 +2,12 @@
 
 This document details AWX's polymorphic job model system.
 
+## What to take away
+
+- UnifiedJob/UnifiedJobTemplate are abstract bases; concrete job types inherit and override `task_class`.
+- The launch path copies template fields into a new job row, then signals scheduling.
+- Relaunch behavior is stored in `JobLaunchConfig` plus `start_args`.
+
 ## Key Files
 
 | File | Purpose |
@@ -72,6 +78,10 @@ class UnifiedJobTemplate(PolymorphicModel, ...):
         return new_job
 ```
 
+### Why Polymorphic Models Matter
+
+`UnifiedJob` lets the scheduler and APIs work with a single "job" shape while still supporting specialized types. That is why many queries are against `UnifiedJob`/`UnifiedJobTemplate`, even if the concrete class is `Job` or `WorkflowJob`.
+
 ## UnifiedJob Base
 
 ```python
@@ -107,6 +117,12 @@ class UnifiedJob(PolymorphicModel, ...):
     def task_class(self):
         raise NotImplementedError  # Subclasses override
 ```
+
+### Template vs Job Fields
+
+Two fields commonly confused:
+- `unified_job_template` lives on every job type and points back to its template.
+- `job_template` is a concrete field only on `Job` (playbook execution).
 
 ## create_unified_job() Deep Dive
 
@@ -156,6 +172,10 @@ def create_unified_job(self, **kwargs):
 
     return new_job
 ```
+
+### Relaunch Data
+
+`JobLaunchConfig` and `start_args` are persisted so relaunch endpoints can replay launch parameters without re-prompting users.
 
 ## signal_start() Deep Dive
 
@@ -238,6 +258,13 @@ class Job(UnifiedJob):
         from awx.main.tasks.jobs import RunJob
         return RunJob
 ```
+
+## Adding a New Job Type (Checklist)
+
+1. Create a concrete template and job model that inherit the unified bases.
+2. Implement `unified_job_class` on the template and `task_class` on the job.
+3. Add serializer and view endpoints if user-launchable.
+4. Ensure scheduler `get_tasks()` includes the new type.
 
 ### ProjectUpdate (SCM Sync)
 

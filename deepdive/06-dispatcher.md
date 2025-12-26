@@ -2,6 +2,12 @@
 
 This document details how AWX dispatches jobs to workers using PostgreSQL LISTEN/NOTIFY.
 
+## What to take away
+
+- The dispatcher is a lightweight queue built on Postgres NOTIFY, not Celery.
+- `@task` wraps callables so they can publish work to a queue.
+- Worker processes listen on `CLUSTER_HOST_ID` plus broadcast queues.
+
 ## Key Files
 
 | File | Purpose |
@@ -10,6 +16,7 @@ This document details how AWX dispatches jobs to workers using PostgreSQL LISTEN
 | `awx/main/dispatch/worker/base.py` | Worker pool implementation |
 | `awx/main/dispatch/pool.py` | Process pool for task execution |
 | `awx/main/dispatch/__init__.py` | PostgreSQL connection helpers |
+| `awx/main/management/commands/run_dispatcher.py` | Dispatcher entrypoint |
 
 ## Why PostgreSQL Instead of RabbitMQ/Redis?
 
@@ -122,23 +129,24 @@ Messages are JSON objects sent via PostgreSQL NOTIFY:
 
 ```python
 @contextmanager
-def pg_bus_conn(new_connection=False):
+def pg_bus_conn():
     """
     Context manager for PostgreSQL pub/sub connection.
     Uses a dedicated connection separate from Django ORM.
     """
+    conf = settings.DATABASES['default']
     conn = psycopg2.connect(
-        dbname=settings.DATABASES['default']['NAME'],
-        host=settings.DATABASES['default']['HOST'],
-        user=settings.DATABASES['default']['USER'],
-        password=settings.DATABASES['default']['PASSWORD']
+        dbname=conf['NAME'],
+        host=conf['HOST'],
+        user=conf['USER'],
+        password=conf['PASSWORD'],
+        port=conf['PORT'],
+        **conf.get("OPTIONS", {})
     )
-    conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-
-    try:
-        yield PubSub(conn)
-    finally:
-        conn.close()
+    conn.set_session(autocommit=True)
+    pubsub = PubSub(conn)
+    yield pubsub
+    conn.close()
 ```
 
 ## Queue Names
@@ -147,17 +155,21 @@ def pg_bus_conn(new_connection=False):
 
 ```python
 def get_local_queuename():
-    """
-    Get the queue name for this node.
-    Format: awx_<hostname>_<pid>
-    """
-    return f"awx_{socket.gethostname()}_{os.getpid()}"
+    return settings.CLUSTER_HOST_ID
 ```
 
 Special queues:
-- `tower_broadcast` - Fan-out to all nodes
-- `awx_<hostname>` - Specific node queue
-- `controlplane` - Control plane nodes only
+- `tower_broadcast` - Fan-out queue for general tasks
+- `tower_broadcast_all` - Fan-out queue used by system tasks
+- `CLUSTER_HOST_ID` - The local node queue (set to hostname in dev)
+
+## Running the Dispatcher
+
+In dev and production, dispatcher workers are started via:
+
+```
+awx-manage run_dispatcher
+```
 
 ## Worker Process
 
@@ -170,34 +182,13 @@ The dispatcher worker:
 4. Executes task in worker pool
 
 ```python
-class AWXConsumerBase:
-    def __init__(self):
-        self.pool = AutoscalePool(
-            min_workers=settings.JOB_EVENT_WORKERS,
-            max_workers=settings.JOB_EVENT_WORKERS
-        )
-
-    def run(self):
+class AWXConsumerPG(AWXConsumerBase):
+    def run(self, *args, **kwargs):
         with pg_bus_conn() as conn:
-            # Subscribe to queues
-            conn.listen(get_local_queuename())
-            conn.listen('tower_broadcast')
-
-            # Main event loop
-            for msg in conn.events():
-                self.process_message(msg)
-
-    def process_message(self, msg):
-        body = json.loads(msg.payload)
-        task_name = body['task']
-        args = body['args']
-        kwargs = body['kwargs']
-
-        # Import and instantiate task
-        task_cls = import_task(task_name)
-
-        # Execute in worker pool
-        self.pool.submit(task_cls.run, *args, **kwargs)
+            for queue in self.queues:
+                conn.listen(queue)
+            for e in conn.events():
+                self.process_task(json.loads(e.payload))
 ```
 
 ## Process Pool
@@ -254,7 +245,7 @@ class AutoscalePool:
 ┌─────────────────────────────────────────────────────────────────┐
 │                  PostgreSQL NOTIFY                               │
 │   conn.notify(queue_name, json.dumps(message))                  │
-│   e.g., NOTIFY awx_control_12345, '{"task": "RunJob", ...}'     │
+│   e.g., NOTIFY <CLUSTER_HOST_ID>, '{"task": "RunJob", ...}'     │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
@@ -266,7 +257,7 @@ class AutoscalePool:
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  Worker Process                                  │
-│   AWXConsumerBase.run() - LISTEN on queue                       │
+│   AWXConsumerPG.run() - LISTEN on queue                         │
 │   Receives NOTIFY message                                       │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │

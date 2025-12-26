@@ -2,37 +2,43 @@
 
 This document provides an end-to-end view of how a job executes in AWX, from the React launch button to websocket updates. Use it with the [architecture map](./00-architecture-index.md) to navigate the deeper drill-downs.
 
+## What to take away
+
+- Launch flows start in the UI, validate via API, then schedule via task manager.
+- The dispatcher publishes to Postgres NOTIFY, and workers execute jobs.
+- Websocket updates are a combination of stored events and live stream.
+
 ## Complete Flow Diagram
 
 ```mermaid
 flowchart TB
   User([User click Launch]) --> FE
-  subgraph Frontend
-    FE[LaunchButton\nawx/ui/src/components/LaunchButton]
+  subgraph Frontend["Frontend"]
+    FE["LaunchButton<br/>awx/ui/src/components/LaunchButton"]
   end
-  FE -->|POST /api/v2/job_templates/{id}/launch/| API
-  subgraph API/Model
-    API[JobTemplateLaunch\nawx/api/views/__init__.py]
-    Model[UnifiedJob create + signal_start\nawx/main/models/unified_jobs.py]
+  FE -->|"POST /api/v2/job_templates/{id}/launch/"| API
+  subgraph APIModel["API/Model"]
+    API["JobTemplateLaunch<br/>awx/api/views/__init__.py"]
+    Model["UnifiedJob create + signal_start<br/>awx/main/models/unified_jobs.py"]
   end
   API --> Model
-  Model -->|schedule_task_manager (on commit)| Sched
-  subgraph Scheduler
-    Sched[task_manager.schedule\nawx/main/scheduler/task_manager.py]
+  Model -->|"schedule_task_manager (on commit)"| Sched
+  subgraph Scheduler["Scheduler"]
+    Sched["task_manager.schedule<br/>awx/main/scheduler/task_manager.py"]
   end
-  Sched -->|start_task → apply_async| Dispatch
-  subgraph Dispatcher
-    Dispatch[publish.apply_async\nPostgreSQL LISTEN/NOTIFY]
+  Sched -->|"start_task -> apply_async"| Dispatch
+  subgraph Dispatcher["Dispatcher"]
+    Dispatch["publish.apply_async<br/>PostgreSQL LISTEN/NOTIFY"]
   end
   Dispatch --> Worker
-  subgraph Execution
-    Worker[celery worker\nawx/main/tasks/jobs.py]
-    Runner[ansible-runner / receptor]
+  subgraph Execution["Execution"]
+    Worker["celery worker<br/>awx/main/tasks/jobs.py"]
+    Runner["ansible-runner / receptor"]
   end
   Worker --> Runner
-  Runner -->|events + status| WS
-  subgraph Events
-    WS[emit_channel_notification\nwebsocket broadcasts]
+  Runner -->|"events + status"| WS
+  subgraph Events["Events"]
+    WS["emit_channel_notification<br/>websocket broadcasts"]
   end
   WS --> FE
 ```
@@ -65,6 +71,14 @@ new → pending → waiting → running → successful
 | `failed` | Playbook failed (Ansible returned non-zero) |
 | `error` | AWX-level error (e.g., can't connect to node) |
 | `canceled` | User or system canceled the job |
+
+## Quick Troubleshooting Map
+
+| Symptom | First Place to Check |
+|---------|----------------------|
+| `pending` forever | Task manager scheduling, instance group capacity |
+| `waiting` forever | Dispatcher running, queue name, worker health |
+| `running` but no output | Callback receiver and websocket connection |
 
 ## Detailed Component Documentation
 

@@ -2,6 +2,12 @@
 
 This document details AWX's instance management, capacity system, and how instances are created in different deployment scenarios.
 
+## What to take away
+
+- Instances are database records; pods/containers are the runtime backing them.
+- Capacity is derived from CPU/memory calculations and is easy to misconfigure.
+- Container Groups are special instance groups with no backing Instance rows.
+
 ## Key Files
 
 | File | Purpose |
@@ -23,6 +29,14 @@ This document details AWX's instance management, capacity system, and how instan
 | Docker Compose | Created via `provision_instance` at startup | Pre-existing containers defined in docker-compose.yml |
 | K8s (static) | Created by AWX Operator | Pods in the AWX deployment |
 | K8s (Container Group) | **No Instance record** | Ephemeral pods created per-job by Receptor |
+
+## Quick Debug Checklist
+
+If a job will not start or stays pending:
+- Verify the job's `instance_group` and whether it has eligible instances.
+- Check `Instance.enabled` and `Instance.capacity` values.
+- If using K8s, confirm resource limits are set so capacity is accurate.
+- For container groups, verify `pod_spec_override` and credentials are valid.
 
 ## Docker Compose: How Instances Work
 

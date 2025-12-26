@@ -2,6 +2,12 @@
 
 This document details how AWX executes Ansible playbooks.
 
+## What to take away
+
+- Task classes own execution lifecycle: setup, run, event streaming, cleanup.
+- Scheduler moves jobs to `waiting`; task layer moves to `running` and terminal states.
+- ansible-runner events are persisted and streamed through the callback queue.
+
 ## Key Files
 
 | File | Purpose |
@@ -93,6 +99,10 @@ class BaseTask:
             # 12. Cleanup
             self.final_run_hook(self.instance, status)
 ```
+
+### Status Transitions in Practice
+
+Scheduler transitions jobs from `pending` to `waiting`. The task layer changes `waiting` to `running`, then to a terminal status (`successful`, `failed`, `error`, `canceled`).
 
 ## RunJob - Playbook Execution
 
@@ -266,6 +276,12 @@ class RunnerCallback:
         elif status_data['status'] in ('successful', 'failed', 'canceled'):
             self.job.websocket_emit_status(status_data['status'])
 ```
+
+## Event Pipeline (Simplified)
+
+1. ansible-runner emits events to `RunnerCallback`.
+2. `RunnerCallback` writes batches to `CallbackQueueDispatcher`.
+3. Callback receiver persists `JobEvent` rows and emits websocket updates.
 
 ## Callback Queue Dispatcher
 

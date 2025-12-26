@@ -2,6 +2,12 @@
 
 This document details how the Django REST Framework API handles job launch requests.
 
+## What to take away
+
+- `GET /launch/` returns a launch configuration snapshot used by the UI to decide prompts.
+- `POST /launch/` validates inputs, creates a job, and triggers scheduling.
+- The serializer is the central validation gate; most launch failures surface here.
+
 ## Key Files
 
 | File | Purpose |
@@ -75,6 +81,12 @@ class JobTemplateLaunch(RetrieveAPIView):
         return Response(data, status=status.HTTP_201_CREATED, headers=headers)
 ```
 
+## Launch Configuration vs Launch Execution
+
+- **GET `/launch/`** uses the same serializer to build a launch configuration payload.
+- **POST `/launch/`** uses the serializer for full validation and job creation.
+- **Survey spec** is fetched separately by the UI: `GET /api/v2/job_templates/{id}/survey_spec/`.
+
 ## Request Validation
 
 **File**: `awx/api/serializers.py`
@@ -142,6 +154,13 @@ Permission types:
 - `change` - Can edit the template
 - `delete` - Can delete the template
 - `admin` - Full control including permission management
+
+## Where Launch Errors Surface
+
+Common failure points and where to look:
+- **Missing prompts**: `JobLaunchSerializer.validate()` raises `ValidationError`.
+- **Pre-start checks**: `UnifiedJob.pre_start()` or `signal_start()` returns False.
+- **Dependency conflicts**: project sync in progress, missing inventory, invalid credentials.
 
 ## Response Format
 
