@@ -1,91 +1,54 @@
 # Job Execution Overview
 
-This document provides a high-level overview of how a job executes in AWX, from user click to completion.
+This document provides an end-to-end view of how a job executes in AWX, from the React launch button to websocket updates. Use it with the [architecture map](./00-architecture-index.md) to navigate the deeper drill-downs.
+
+## What to take away
+
+- Launch flows start in the UI, validate via API, then schedule via task manager.
+- The dispatcher publishes to Postgres NOTIFY, and workers execute jobs.
+- Websocket updates are a combination of stored events and live stream.
 
 ## Complete Flow Diagram
 
+```mermaid
+flowchart TB
+  User([User click Launch]) --> FE
+  subgraph Frontend["Frontend"]
+    FE["LaunchButton<br/>awx/ui/src/components/LaunchButton"]
+  end
+  FE -->|"POST /api/v2/job_templates/{id}/launch/"| API
+  subgraph APIModel["API/Model"]
+    API["JobTemplateLaunch<br/>awx/api/views/__init__.py"]
+    Model["UnifiedJob create + signal_start<br/>awx/main/models/unified_jobs.py"]
+  end
+  API --> Model
+  Model -->|"schedule_task_manager (on commit)"| Sched
+  subgraph Scheduler["Scheduler"]
+    Sched["task_manager.schedule<br/>awx/main/scheduler/task_manager.py"]
+  end
+  Sched -->|"start_task -> apply_async"| Dispatch
+  subgraph Dispatcher["Dispatcher"]
+    Dispatch["publish.apply_async<br/>PostgreSQL LISTEN/NOTIFY"]
+  end
+  Dispatch --> Worker
+  subgraph Execution["Execution"]
+    Worker["celery worker<br/>awx/main/tasks/jobs.py"]
+    Runner["ansible-runner / receptor"]
+  end
+  Worker --> Runner
+  Runner -->|"events + status"| WS
+  subgraph Events["Events"]
+    WS["emit_channel_notification<br/>websocket broadcasts"]
+  end
+  WS --> FE
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              USER ACTION                                      │
-│                         Click "Launch" Button                                 │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  FRONTEND (React)                                                             │
-│  awx/ui/src/components/LaunchButton/LaunchButton.js                          │
-│                                                                               │
-│  handleLaunch() → JobTemplatesAPI.launch(id, params)                         │
-│                   POST /api/v2/job_templates/{id}/launch/                    │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  API LAYER (Django REST Framework)                                           │
-│  awx/api/views/__init__.py:2354 - JobTemplateLaunch                          │
-│                                                                               │
-│  post() → validate → create_unified_job() → signal_start()                   │
-│         → Return 201 {job_id, status, ...}                                   │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  MODEL LAYER                                                                  │
-│  awx/main/models/unified_jobs.py                                             │
-│                                                                               │
-│  create_unified_job():334 → Copy template → Save Job (status=new)            │
-│  signal_start():1342 → status=pending → websocket_emit → schedule_task_mgr   │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  SCHEDULER                                                                    │
-│  awx/main/scheduler/task_manager.py                                          │
-│                                                                               │
-│  schedule():708 → Lock → process_pending_tasks() → start_task()              │
-│  start_task():259 → status=waiting → assign node → apply_async()             │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  DISPATCHER                                                                   │
-│  awx/main/dispatch/publish.py                                                │
-│                                                                               │
-│  apply_async() → pg_bus_conn.notify(queue, message)                          │
-│               → PostgreSQL LISTEN/NOTIFY                                     │
-│               → Worker pool receives message                                 │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  EXECUTION                                                                    │
-│  awx/main/tasks/jobs.py - RunJob.run()                                       │
-│                                                                               │
-│  run():397 → status=running → build context → inject credentials             │
-│           → AWXReceptorJob.run() OR ansible_runner.run()                     │
-│           → Ansible playbook executes                                        │
-│           → status=successful/failed → cleanup                               │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  CALLBACKS                                                                    │
-│  awx/main/tasks/callback.py - RunnerCallback                                 │
-│                                                                               │
-│  For each Ansible event:                                                     │
-│  event_handler():70 → process → dispatcher.dispatch() → Save JobEvent       │
-│                     → WebSocket emit (rate-limited)                          │
-└─────────────────────────────────────────┬────────────────────────────────────┘
-                                          │
-                                          ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  WEBSOCKET                                                                    │
-│  awx/main/models/unified_jobs.py:1255                                        │
-│                                                                               │
-│  websocket_emit_status() → emit_channel_notification('jobs-status_changed')  │
-│                          → Frontend receives real-time updates               │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+
+### Code checkpoints
+- **Launch entrypoint**: `JobTemplateLaunch.post()` validates prompts and permissions before calling `create_unified_job()` and returning the new job identifier.
+- **Durable scheduling**: `schedule_task_manager()` uses `connection.on_commit` so the scheduler only runs after the new job row is committed.
+- **Placement**: `task_manager.schedule()` locks, gathers runnable jobs, assigns an instance group/instance, then publishes via `start_task()` and `publish.apply_async()`.
+- **Execution**: celery workers execute `RunJob` (or receptor variants) from `awx/main/tasks/jobs.py`, writing events as ansible-runner streams callbacks.
+- **Realtime updates**: `UnifiedJob.websocket_emit_status()` and callback handlers emit `jobs-status_changed` notifications so the UI updates without polling.
 
 ## Job Status Transitions
 
@@ -108,6 +71,14 @@ new → pending → waiting → running → successful
 | `failed` | Playbook failed (Ansible returned non-zero) |
 | `error` | AWX-level error (e.g., can't connect to node) |
 | `canceled` | User or system canceled the job |
+
+## Quick Troubleshooting Map
+
+| Symptom | First Place to Check |
+|---------|----------------------|
+| `pending` forever | Task manager scheduling, instance group capacity |
+| `waiting` forever | Dispatcher running, queue name, worker health |
+| `running` but no output | Callback receiver and websocket connection |
 
 ## Detailed Component Documentation
 

@@ -2,6 +2,12 @@
 
 This document details how AWX schedules jobs across instances.
 
+## What to take away
+
+- Task Manager runs periodically and on-demand after job creation.
+- It builds a unified task list, enforces dependencies, and assigns instances.
+- Most "job stuck in pending" issues are capacity or dependency related.
+
 ## Key Files
 
 | File | Purpose |
@@ -48,6 +54,15 @@ def schedule_task_manager():
 ```
 
 Called from `signal_start()` after job transitions to `pending`.
+
+## Common Scheduling Failure Modes
+
+| Symptom | Likely Cause | Where to Look |
+|---------|--------------|---------------|
+| Job stays `pending` | Missing dependencies | `create_dependencies()` and `has_pending_dependencies()` |
+| Job stays `pending` | No eligible instance group | `get_instance_group()` |
+| Job stays `pending` | Capacity exhausted | `has_capacity()` and instance capacity values |
+| Job stuck `waiting` | Dispatcher not running | `awx/main/management/commands/run_dispatcher.py` |
 
 ## TaskManager.schedule() Entry Point
 

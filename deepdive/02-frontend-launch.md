@@ -6,43 +6,44 @@ This document details how the React frontend handles job launches.
 
 | File | Purpose |
 |------|---------|
-| `awx/ui/src/components/LaunchButton/LaunchButton.js` | Main launch button component |
-| `awx/ui/src/api/models/JobTemplates.js` | API client for job templates |
+| `awx/ui/src/components/LaunchButton/LaunchButton.js` | Main launch button component and relaunch handling |
+| `awx/ui/src/components/LaunchPrompt/LaunchPrompt.js` | Prompt UI for inventory, credentials, survey, and vars |
+| `awx/ui/src/api/models/JobTemplates.js` | API client for job templates and surveys |
+| `awx/ui/src/api/models/Jobs.js` | Relaunch and job actions |
+| `awx/ui/src/screens/Job/JobOutput/connectJobSocket.js` | Job output websocket stream |
 | `awx/ui/src/api/Base.js` | Base HTTP client (Axios wrapper) |
 
 ## Launch Button Component
 
 **File**: `awx/ui/src/components/LaunchButton/LaunchButton.js`
 
-The `LaunchButton` component handles the complexity of job launches, including:
-- Checking if the template requires prompts (inventory, credentials, survey, etc.)
-- Showing the appropriate wizard if prompts are needed
-- Launching directly if no prompts required
+The `LaunchButton` component orchestrates launches and relaunches for multiple resource types:
+- `job_template` and `workflow_job_template` launches
+- `job`, `workflow_job`, `project_update`, `inventory_update`, and `ad_hoc_command` relaunches
+- Prompt display when launch config requires user input
 
 ### handleLaunch() Flow
 
 ```javascript
-handleLaunch = async () => {
-  const { resource } = this.props;
+const handleLaunch = async () => {
+  setIsLaunching(true);
 
-  // 1. Get launch configuration
-  // GET /api/v2/job_templates/{id}/launch/
-  const { data: launchConfig } = await JobTemplatesAPI.readLaunch(resource.id);
+  // 1. Fetch launch configuration
+  // GET /api/v2/job_templates/{id}/launch/ (or workflow equivalent)
+  const { data: launch } = await readLaunch(resource.id);
+  setLaunchConfig(launch);
 
-  // 2. Check if prompts are needed
-  if (launchConfig.ask_inventory_on_launch ||
-      launchConfig.ask_credential_on_launch ||
-      launchConfig.survey_enabled ||
-      /* other prompt conditions */) {
-    // Show launch wizard modal
-    this.setState({ showLaunchWizard: true, launchConfig });
+  // 2. Fetch survey spec only if needed
+  if (launch.survey_enabled) {
+    const { data: survey } = await readSurvey(resource.id);
+    setSurveyConfig(survey);
+  }
+
+  // 3. Decide between direct launch vs prompt
+  if (canLaunchWithoutPrompt(launch)) {
+    await launchWithParams({});
   } else {
-    // 3. Launch directly
-    // POST /api/v2/job_templates/{id}/launch/
-    const { data: job } = await JobTemplatesAPI.launch(resource.id, {});
-
-    // 4. Redirect to job output
-    history.push(`/jobs/${job.id}/output`);
+    setShowLaunchPrompt(true);
   }
 };
 ```
@@ -68,6 +69,11 @@ class JobTemplates extends SchedulesMixin(
   // GET /api/v2/job_templates/{id}/launch/
   readLaunch(id) {
     return this.http.get(`${this.baseUrl}${id}/launch/`);
+  }
+
+  // GET /api/v2/job_templates/{id}/survey_spec/
+  readSurvey(id) {
+    return this.http.get(`${this.baseUrl}${id}/survey_spec/`);
   }
 }
 ```
@@ -114,26 +120,36 @@ The `readLaunch()` endpoint returns configuration telling the UI what prompts ar
 }
 ```
 
-## Launch Wizard
+## Launch Prompt UI
 
-When prompts are required, the `LaunchPromptWizard` component is shown, which:
+When prompts are required, the `LaunchPrompt` component is shown, which:
 1. Steps through required prompts (inventory, credentials, survey, etc.)
 2. Collects user input
 3. Validates responses
 4. Submits the launch with collected data
 
+**File**: `awx/ui/src/components/LaunchPrompt/LaunchPrompt.js`
+
+## Relaunch Flow
+
+For existing jobs or updates, the LaunchButton uses relaunch endpoints:
+- Jobs: `JobsAPI.relaunch(id, params)`
+- Workflow jobs: `WorkflowJobsAPI.relaunch(id, params)`
+- Project/inventory updates: `ProjectsAPI.launchUpdate(id)` / `InventorySourcesAPI.launchUpdate(id)`
+
+The relaunch path reuses the same prompt logic when passwords or variables are required.
+
 ## WebSocket Connection
 
-The frontend maintains a WebSocket connection to `/websocket/` for real-time updates:
+Job output uses a WebSocket connection to `/websocket/` for real-time updates:
 
-**File**: `awx/ui/src/App.js` (WebSocket setup)
+**File**: `awx/ui/src/screens/Job/JobOutput/connectJobSocket.js`
 
 ```javascript
-// Subscribes to job status updates
-socket.subscribe('jobs-status_changed', handleJobStatusChange);
-
-// For workflow jobs
-socket.subscribe('workflow_events-{id}', handleWorkflowEvent);
+ws.send(JSON.stringify({
+  group_name: `jobs`,
+  group_data: { id: jobId }
+}));
 ```
 
 This enables real-time job output streaming and status updates without polling.
